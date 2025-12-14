@@ -96,7 +96,13 @@ apt-get upgrade -y -qq
 # Install required packages
 echo ""
 echo "Installing required packages..."
-apt-get install -y -qq nginx mysql-server php-fpm php-mysql php-mbstring php-xml php-curl unzip openssl
+# Detect PHP version and install appropriate packages
+PHP_VERSION=$(apt-cache search --names-only '^php[0-9]' | grep -oP 'php\d+\.\d+' | sort -V | tail -1)
+if [ -z "$PHP_VERSION" ]; then
+    PHP_VERSION="php"
+fi
+
+apt-get install -y -qq nginx mysql-server ${PHP_VERSION}-fpm ${PHP_VERSION}-mysql ${PHP_VERSION}-mbstring ${PHP_VERSION}-xml ${PHP_VERSION}-curl unzip openssl
 
 # Configure MySQL automatically
 echo ""
@@ -212,6 +218,7 @@ server {
 
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
+        # Try to find PHP-FPM socket automatically
         fastcgi_pass unix:/var/run/php/php-fpm.sock;
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         include fastcgi_params;
@@ -240,9 +247,51 @@ nginx -t
 # Restart services
 echo "Restarting services..."
 systemctl restart nginx
-systemctl restart php*-fpm
 systemctl enable nginx
-systemctl enable php*-fpm
+
+# Find and restart PHP-FPM service
+PHP_FPM_SERVICE=""
+
+# Method 1: Check installed PHP packages to determine version
+INSTALLED_PHP=$(dpkg -l | grep -E '^ii\s+php[0-9]' | grep fpm | head -n 1 | awk '{print $2}' | sed 's/-fpm.*//')
+if [ -n "$INSTALLED_PHP" ]; then
+    PHP_FPM_SERVICE="${INSTALLED_PHP}-fpm"
+fi
+
+# Method 2: Try common service names
+if [ -z "$PHP_FPM_SERVICE" ]; then
+    for service in php8.3-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm php7.3-fpm php-fpm; do
+        if systemctl list-unit-files 2>/dev/null | grep -q "^${service}.service"; then
+            PHP_FPM_SERVICE="$service"
+            break
+        fi
+    done
+fi
+
+# Method 3: Search all unit files
+if [ -z "$PHP_FPM_SERVICE" ]; then
+    PHP_FPM_SERVICE=$(systemctl list-unit-files 2>/dev/null | grep -E 'php.*fpm\.service' | head -n 1 | awk '{print $1}' | sed 's/\.service$//')
+fi
+
+# Method 4: Check running services
+if [ -z "$PHP_FPM_SERVICE" ]; then
+    PHP_FPM_SERVICE=$(systemctl list-units --type=service 2>/dev/null | grep -E 'php.*fpm' | head -n 1 | awk '{print $1}' | sed 's/\.service$//')
+fi
+
+if [ -n "$PHP_FPM_SERVICE" ]; then
+    echo "Found PHP-FPM service: $PHP_FPM_SERVICE"
+    if systemctl restart "$PHP_FPM_SERVICE" 2>/dev/null; then
+        echo "PHP-FPM restarted successfully"
+    else
+        service "$PHP_FPM_SERVICE" restart 2>/dev/null || true
+    fi
+    # Try to enable, but don't fail if it doesn't work
+    systemctl enable "$PHP_FPM_SERVICE" 2>/dev/null || true
+else
+    echo "Warning: Could not automatically detect PHP-FPM service name."
+    echo "PHP-FPM may need to be restarted manually."
+    echo "Common service names: php8.2-fpm, php8.1-fpm, php8.0-fpm, php-fpm"
+fi
 
 # SSL/HTTPS Setup
 if [ "$SETUP_HTTPS" = "y" ] || [ "$SETUP_HTTPS" = "Y" ]; then
