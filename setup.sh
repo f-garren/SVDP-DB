@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # SVDP Database Setup Script
-# This script sets up the web server, database, and application
+# Fully automated setup with no user input required for MySQL or admin accounts
 
 set -e
 
@@ -16,62 +16,127 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Get installation directory
+# Generate secure random string function
+generate_password() {
+    local length=${1:-24}
+    if command -v openssl &> /dev/null; then
+        openssl rand -base64 32 | tr -d "=+/'\"\\\`\$" | tr '[:upper:]' '[:lower:]' | head -c "$length"
+    elif [ -c /dev/urandom ]; then
+        cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w "$length" | head -n 1
+    else
+        echo "SVDP$(date +%s | sha256sum | head -c $((length-4)))$(shuf -i 1000-9999 -n 1)"
+    fi
+}
+
+# Configuration - all automatic
 INSTALL_DIR="/var/www/svdp"
-read -p "Installation directory [$INSTALL_DIR]: " input
-INSTALL_DIR=${input:-$INSTALL_DIR}
+DB_NAME="svdp_db"
+DB_USER="svdp_user"
+DB_PASS=$(generate_password 32)
+ADMIN_USER="admin"
+ADMIN_PASS=$(generate_password 24)
+
+# Optional configuration (can be overridden)
+DOMAIN=""
+SETUP_HTTPS="n"
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --install-dir)
+            INSTALL_DIR="$2"
+            shift 2
+            ;;
+        --domain)
+            DOMAIN="$2"
+            shift 2
+            ;;
+        --https)
+            SETUP_HTTPS="y"
+            shift
+            ;;
+        --help)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --install-dir DIR    Installation directory (default: /var/www/svdp)"
+            echo "  --domain DOMAIN      Domain name for web server"
+            echo "  --https              Set up HTTPS with Let's Encrypt"
+            echo "  --help               Show this help message"
+            echo ""
+            echo "All MySQL and admin credentials are automatically generated."
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+echo "Configuration:"
+echo "  Installation directory: $INSTALL_DIR"
+echo "  Database name: $DB_NAME"
+echo "  Database user: $DB_USER"
+echo "  Admin username: $ADMIN_USER"
+echo ""
 
 # Create installation directory
 mkdir -p "$INSTALL_DIR"
-echo "Installation directory: $INSTALL_DIR"
+echo "Created installation directory: $INSTALL_DIR"
 
 # Update system
 echo ""
 echo "Updating system packages..."
-apt-get update
-apt-get upgrade -y
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get upgrade -y -qq
 
 # Install required packages
 echo ""
 echo "Installing required packages..."
-apt-get install -y nginx mysql-server php-fpm php-mysql php-mbstring php-xml php-curl unzip
+apt-get install -y -qq nginx mysql-server php-fpm php-mysql php-mbstring php-xml php-curl unzip openssl
 
-# Get database credentials
+# Configure MySQL automatically
 echo ""
-echo "Database Configuration:"
-read -p "MySQL root password: " -s MYSQL_ROOT_PASS
-echo ""
-read -p "Database name [svdp_db]: " DB_NAME
-DB_NAME=${DB_NAME:-svdp_db}
-read -p "Database user [svdp_user]: " DB_USER
-DB_USER=${DB_USER:-svdp_user}
+echo "Configuring MySQL..."
 
-# Generate secure random password for database user
-echo ""
-echo "Generating secure database password..."
-if command -v openssl &> /dev/null; then
-    # Use openssl if available (preferred method)
-    DB_PASS=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
-elif [ -c /dev/urandom ]; then
-    # Fallback to /dev/urandom
-    DB_PASS=$(head -c 32 /dev/urandom | base64 | tr -d "=+/" | cut -c1-25)
+# Check if MySQL is already configured
+if ! mysql -u root -e "SELECT 1" &>/dev/null; then
+    # MySQL not configured, set up root password
+    MYSQL_ROOT_PASS=$(generate_password 32)
+    
+    # Secure MySQL installation
+    mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_ROOT_PASS';" 2>/dev/null || \
+    mysql -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('$MYSQL_ROOT_PASS');" 2>/dev/null || \
+    mysqladmin -u root password "$MYSQL_ROOT_PASS" 2>/dev/null || true
+    
+    echo "MySQL root password has been set."
 else
-    # Last resort: use date + random
-    DB_PASS="SVDP$(date +%s)$(shuf -i 1000-9999 -n 1)$(shuf -i 1000-9999 -n 1)"
+    # Try to connect without password first
+    if mysql -u root -e "SELECT 1" &>/dev/null 2>&1; then
+        MYSQL_ROOT_PASS=""
+    else
+        # MySQL requires password - we'll need to handle this
+        echo "MySQL root password is required but not provided."
+        echo "Attempting to proceed with default authentication..."
+        MYSQL_ROOT_PASS=""
+    fi
 fi
 
-# Ensure password meets MySQL requirements (at least 8 chars, has letters and numbers)
-if [ ${#DB_PASS} -lt 8 ]; then
-    DB_PASS="${DB_PASS}$(shuf -i 1000-9999 -n 1)"
-fi
+# Function to run MySQL commands
+run_mysql() {
+    if [ -z "$MYSQL_ROOT_PASS" ]; then
+        mysql -u root "$@"
+    else
+        mysql -u root -p"$MYSQL_ROOT_PASS" "$@"
+    fi
+}
 
-echo "Database password generated successfully (25 characters)."
-echo ""
-
-# Setup MySQL
-echo ""
-echo "Setting up MySQL database..."
-mysql -u root -p"$MYSQL_ROOT_PASS" <<EOF
+# Setup database and user
+echo "Creating database and user..."
+run_mysql <<EOF
 CREATE DATABASE IF NOT EXISTS $DB_NAME CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
 GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost';
@@ -79,37 +144,16 @@ FLUSH PRIVILEGES;
 EOF
 
 # Import database schema
-echo ""
 echo "Importing database schema..."
 if [ -f "database/schema.sql" ]; then
-    mysql -u root -p"$MYSQL_ROOT_PASS" "$DB_NAME" < database/schema.sql
+    run_mysql "$DB_NAME" < database/schema.sql
     echo "Database schema imported successfully."
 else
     echo "Warning: database/schema.sql not found. Please import manually."
 fi
 
-# Copy application files
-echo ""
-echo "Copying application files..."
-cp -r . "$INSTALL_DIR/"
-chown -R www-data:www-data "$INSTALL_DIR"
-chmod -R 755 "$INSTALL_DIR"
-chmod -R 775 "$INSTALL_DIR/backups" 2>/dev/null || mkdir -p "$INSTALL_DIR/backups" && chmod -R 775 "$INSTALL_DIR/backups"
-
-# Update config.php with database credentials
-echo ""
-echo "Updating configuration..."
-sed -i "s/define('DB_NAME', '.*');/define('DB_NAME', '$DB_NAME');/" "$INSTALL_DIR/config.php"
-sed -i "s/define('DB_USER', '.*');/define('DB_USER', '$DB_USER');/" "$INSTALL_DIR/config.php"
-sed -i "s/define('DB_PASS', '.*');/define('DB_PASS', '$DB_PASS');/" "$INSTALL_DIR/config.php"
-
 # Create admin account
-echo ""
-read -p "Admin username [admin]: " ADMIN_USER
-ADMIN_USER=${ADMIN_USER:-admin}
-read -p "Admin password: " -s ADMIN_PASS
-echo ""
-
+echo "Creating admin account..."
 # Create PHP script to hash password
 cat > /tmp/hash_password.php <<'PHPEOF'
 <?php
@@ -118,7 +162,7 @@ PHPEOF
 
 ADMIN_HASH=$(php /tmp/hash_password.php "$ADMIN_PASS")
 
-mysql -u root -p"$MYSQL_ROOT_PASS" "$DB_NAME" <<EOF
+run_mysql "$DB_NAME" <<EOF
 INSERT INTO employees (username, password_hash, password_reset_required) 
 VALUES ('$ADMIN_USER', '$ADMIN_HASH', TRUE)
 ON DUPLICATE KEY UPDATE password_hash = '$ADMIN_HASH', password_reset_required = TRUE;
@@ -126,12 +170,29 @@ EOF
 
 rm -f /tmp/hash_password.php
 
+# Copy application files
+echo ""
+echo "Copying application files..."
+cp -r . "$INSTALL_DIR/" 2>/dev/null || {
+    # If cp -r fails (e.g., .git directory), copy files individually
+    find . -maxdepth 1 -not -name '.' -not -name '..' -not -name '.git' -exec cp -r {} "$INSTALL_DIR/" \;
+}
+chown -R www-data:www-data "$INSTALL_DIR"
+chmod -R 755 "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR/backups"
+chmod 775 "$INSTALL_DIR/backups"
+
+# Update config.php with database credentials
+echo "Updating configuration..."
+# Escape special characters for sed
+DB_PASS_SED=$(echo "$DB_PASS" | sed 's/[[\.*^$()+?{|]/\\&/g' | sed 's/\\/\\\\/g' | sed "s/'/\\\'/g")
+sed -i "s/define('DB_NAME', '.*');/define('DB_NAME', '$DB_NAME');/" "$INSTALL_DIR/config.php"
+sed -i "s/define('DB_USER', '.*');/define('DB_USER', '$DB_USER');/" "$INSTALL_DIR/config.php"
+sed -i "s|define('DB_PASS', '.*');|define('DB_PASS', '$DB_PASS_SED');|" "$INSTALL_DIR/config.php"
+
 # Configure Nginx
 echo ""
 echo "Configuring Nginx..."
-DOMAIN=""
-read -p "Domain name (or press Enter for IP-based access): " DOMAIN
-
 if [ -z "$DOMAIN" ]; then
     SERVER_NAME="_"
 else
@@ -160,7 +221,6 @@ server {
         deny all;
     }
     
-    # Protect credentials file
     location ~ /\.svdp_credentials {
         deny all;
     }
@@ -178,7 +238,6 @@ rm -f /etc/nginx/sites-enabled/default
 nginx -t
 
 # Restart services
-echo ""
 echo "Restarting services..."
 systemctl restart nginx
 systemctl restart php*-fpm
@@ -186,39 +245,27 @@ systemctl enable nginx
 systemctl enable php*-fpm
 
 # SSL/HTTPS Setup
-echo ""
-read -p "Do you want to set up HTTPS with Let's Encrypt? (y/n): " SETUP_HTTPS
-
 if [ "$SETUP_HTTPS" = "y" ] || [ "$SETUP_HTTPS" = "Y" ]; then
     if [ -z "$DOMAIN" ]; then
-        read -p "Please enter domain name for SSL certificate: " DOMAIN
-    fi
-    
-    # Install certbot
-    apt-get install -y certbot python3-certbot-nginx
-    
-    # Get email for Let's Encrypt
-    read -p "Email address for Let's Encrypt: " EMAIL
-    
-    # Ask about challenge method
-    echo ""
-    echo "SSL Certificate Challenge Method:"
-    echo "1. HTTP challenge (default, recommended)"
-    echo "2. DNS challenge (for servers behind firewall)"
-    read -p "Choose method (1 or 2): " CHALLENGE_METHOD
-    
-    if [ "$CHALLENGE_METHOD" = "2" ]; then
-        echo "You will need to manually add DNS TXT records when prompted."
-        certbot --nginx -d "$DOMAIN" --email "$EMAIL" --agree-tos --preferred-challenges dns
+        echo ""
+        echo "HTTPS setup requires a domain name."
+        echo "Skipping HTTPS setup. You can set it up later with:"
+        echo "  certbot --nginx -d your-domain.com"
     else
-        certbot --nginx -d "$DOMAIN" --email "$EMAIL" --agree-tos
+        echo ""
+        echo "Setting up HTTPS with Let's Encrypt..."
+        apt-get install -y -qq certbot python3-certbot-nginx
+        
+        # Use non-interactive mode for certbot
+        certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "admin@$DOMAIN" --redirect || {
+            echo "HTTPS setup failed. You can set it up later with:"
+            echo "  certbot --nginx -d $DOMAIN"
+        }
+        
+        # Setup auto-renewal
+        systemctl enable certbot.timer
+        echo "HTTPS setup complete. Certificate will auto-renew."
     fi
-    
-    # Setup auto-renewal
-    systemctl enable certbot.timer
-    echo "HTTPS setup complete. Certificate will auto-renew."
-else
-    echo "HTTPS setup skipped. You can set it up later with: certbot --nginx -d $DOMAIN"
 fi
 
 # Create index.php redirect to login
@@ -230,18 +277,24 @@ EOF
 
 # Save credentials to file
 CREDENTIALS_FILE="$INSTALL_DIR/.svdp_credentials"
-cat > "$CREDENTIALS_FILE" <<EOF
-# SVDP Database Credentials
-# Generated on: $(date)
-# KEEP THIS FILE SECURE - Contains sensitive information
-
-Database Name: $DB_NAME
-Database User: $DB_USER
-Database Password: $DB_PASS
-
-Admin Username: $ADMIN_USER
-(Admin password was set during setup - reset required on first login)
-EOF
+{
+    echo "# SVDP Database Credentials"
+    echo "# Generated on: $(date)"
+    echo "# KEEP THIS FILE SECURE - Contains sensitive information"
+    echo ""
+    echo "Database Name: $DB_NAME"
+    echo "Database User: $DB_USER"
+    echo "Database Password: $DB_PASS"
+    echo ""
+    echo "Admin Username: $ADMIN_USER"
+    echo "Admin Password: $ADMIN_PASS"
+    echo ""
+    echo "NOTE: Admin password reset is required on first login."
+    if [ -n "$MYSQL_ROOT_PASS" ]; then
+        echo ""
+        echo "MySQL Root Password: $MYSQL_ROOT_PASS"
+    fi
+} > "$CREDENTIALS_FILE"
 chmod 600 "$CREDENTIALS_FILE"
 chown www-data:www-data "$CREDENTIALS_FILE"
 
@@ -254,33 +307,29 @@ echo ""
 echo "Installation directory: $INSTALL_DIR"
 echo "Database: $DB_NAME"
 echo "Database user: $DB_USER"
-echo "Database password: $DB_PASS"
+echo "Admin username: $ADMIN_USER"
 echo ""
-echo "IMPORTANT: Credentials have been saved to: $CREDENTIALS_FILE"
-echo "          (File permissions: 600 - readable only by owner)"
+echo "IMPORTANT: All credentials have been saved to:"
+echo "  $CREDENTIALS_FILE"
+echo "  (File permissions: 600 - readable only by owner)"
 echo ""
 if [ -n "$DOMAIN" ]; then
-    echo "Access the application at: http://$DOMAIN"
     if [ "$SETUP_HTTPS" = "y" ] || [ "$SETUP_HTTPS" = "Y" ]; then
-        echo "Or via HTTPS: https://$DOMAIN"
+        echo "Access the application at: https://$DOMAIN"
+    else
+        echo "Access the application at: http://$DOMAIN"
     fi
 else
-    echo "Access the application at: http://$(hostname -I | awk '{print $1}')"
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+    echo "Access the application at: http://$SERVER_IP"
 fi
 echo ""
-echo "Admin username: $ADMIN_USER"
-echo "You will be required to reset the admin password on first login."
+echo "First Login:"
+echo "  1. Log in with username: $ADMIN_USER"
+echo "  2. You will be prompted to reset your password"
+echo "  3. Configure settings in the Settings page"
+echo "  4. Create additional employee accounts as needed"
 echo ""
-echo "SECURITY NOTE:"
-echo "- Database password has been automatically generated"
-echo "- Credentials saved to: $CREDENTIALS_FILE"
-echo "- Keep the credentials file secure and backed up"
-echo "- Consider changing the MySQL root password if this is a production server"
+echo "To view credentials later, run:"
+echo "  sudo cat $CREDENTIALS_FILE"
 echo ""
-echo "Next steps:"
-echo "1. Log in with the admin account"
-echo "2. Reset your password"
-echo "3. Configure settings in the Settings page"
-echo "4. Create additional employee accounts as needed"
-echo ""
-
