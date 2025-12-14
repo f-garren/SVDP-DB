@@ -36,10 +36,15 @@ A comprehensive web application for managing a non-profit food distribution and 
    ```
 3. Follow the prompts to configure:
    - Installation directory (default: `/var/www/svdp`)
-   - Database credentials
-   - Admin account
+   - MySQL root password (required)
+   - Database name (default: `svdp_db`)
+   - Database user (default: `svdp_user`)
+   - **Database password is automatically generated** (25 characters, secure random)
+   - Admin account username and password
    - Domain name (optional)
    - HTTPS setup (optional, recommended)
+
+**Note**: The database password is automatically generated and saved to `.svdp_credentials` file in the installation directory. Keep this file secure!
 
 ### Manual Setup
 

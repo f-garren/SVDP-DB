@@ -1,0 +1,43 @@
+# SVDP Database Application .gitignore
+
+# Credentials and sensitive files
+.svdp_credentials
+*.credentials
+config.local.php
+
+# Logs
+logs/
+*.log
+php_errors.log
+
+# Backups
+backups/
+*.sql
+*.backup
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# PHP
+vendor/
+composer.lock
+
+# Cache
+cache/
+*.cache
+

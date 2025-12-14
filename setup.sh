@@ -45,7 +45,27 @@ read -p "Database name [svdp_db]: " DB_NAME
 DB_NAME=${DB_NAME:-svdp_db}
 read -p "Database user [svdp_user]: " DB_USER
 DB_USER=${DB_USER:-svdp_user}
-read -p "Database password: " -s DB_PASS
+
+# Generate secure random password for database user
+echo ""
+echo "Generating secure database password..."
+if command -v openssl &> /dev/null; then
+    # Use openssl if available (preferred method)
+    DB_PASS=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
+elif [ -c /dev/urandom ]; then
+    # Fallback to /dev/urandom
+    DB_PASS=$(head -c 32 /dev/urandom | base64 | tr -d "=+/" | cut -c1-25)
+else
+    # Last resort: use date + random
+    DB_PASS="SVDP$(date +%s)$(shuf -i 1000-9999 -n 1)$(shuf -i 1000-9999 -n 1)"
+fi
+
+# Ensure password meets MySQL requirements (at least 8 chars, has letters and numbers)
+if [ ${#DB_PASS} -lt 8 ]; then
+    DB_PASS="${DB_PASS}$(shuf -i 1000-9999 -n 1)"
+fi
+
+echo "Database password generated successfully (25 characters)."
 echo ""
 
 # Setup MySQL
@@ -139,6 +159,15 @@ server {
     location ~ /\.ht {
         deny all;
     }
+    
+    # Protect credentials file
+    location ~ /\.svdp_credentials {
+        deny all;
+    }
+    
+    location ~ /.*\.credentials {
+        deny all;
+    }
 }
 EOF
 
@@ -199,6 +228,23 @@ header('Location: /login.php');
 exit;
 EOF
 
+# Save credentials to file
+CREDENTIALS_FILE="$INSTALL_DIR/.svdp_credentials"
+cat > "$CREDENTIALS_FILE" <<EOF
+# SVDP Database Credentials
+# Generated on: $(date)
+# KEEP THIS FILE SECURE - Contains sensitive information
+
+Database Name: $DB_NAME
+Database User: $DB_USER
+Database Password: $DB_PASS
+
+Admin Username: $ADMIN_USER
+(Admin password was set during setup - reset required on first login)
+EOF
+chmod 600 "$CREDENTIALS_FILE"
+chown www-data:www-data "$CREDENTIALS_FILE"
+
 # Final instructions
 echo ""
 echo "========================================="
@@ -208,6 +254,10 @@ echo ""
 echo "Installation directory: $INSTALL_DIR"
 echo "Database: $DB_NAME"
 echo "Database user: $DB_USER"
+echo "Database password: $DB_PASS"
+echo ""
+echo "IMPORTANT: Credentials have been saved to: $CREDENTIALS_FILE"
+echo "          (File permissions: 600 - readable only by owner)"
 echo ""
 if [ -n "$DOMAIN" ]; then
     echo "Access the application at: http://$DOMAIN"
@@ -220,6 +270,12 @@ fi
 echo ""
 echo "Admin username: $ADMIN_USER"
 echo "You will be required to reset the admin password on first login."
+echo ""
+echo "SECURITY NOTE:"
+echo "- Database password has been automatically generated"
+echo "- Credentials saved to: $CREDENTIALS_FILE"
+echo "- Keep the credentials file secure and backed up"
+echo "- Consider changing the MySQL root password if this is a production server"
 echo ""
 echo "Next steps:"
 echo "1. Log in with the admin account"

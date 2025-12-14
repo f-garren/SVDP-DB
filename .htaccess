@@ -8,7 +8,7 @@ RewriteEngine On
 RewriteRule ^$ /login.php [R=302,L]
 
 # Protect sensitive files
-<FilesMatch "^(config\.php|\.htaccess|\.git)">
+<FilesMatch "^(config\.php|\.htaccess|\.git|\.svdp_credentials|.*\.credentials)">
     Order allow,deny
     Deny from all
 </FilesMatch>
